@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+  <head><title>Bot Dashboard</title></head>
+  <body>
+    <h2>Bot Dashboard</h2>
+    <p>Logged in as {{session.user}}</p>
+    <form method="post">
+      <label>NVDA Speech Viewer title: <input name="speech_title" value="{{speech_title}}"></label><br>
+      <label>Game window title: <input name="game_title" value="{{game_title}}"></label><br>
+      <label>Direction policy:
+        <select name="direction_policy">
+          <option value="rotate">rotate</option>
+          <option value="reverse">reverse</option>
+          <option value="random">random</option>
+        </select>
+      </label><br>
+      <label>Script:</label><br>
+      <textarea name="script_text" rows="18" cols="80">{{default_script}}</textarea><br>
+      <button name="start_cmd" value="start" type="submit">Start</button>
+      <button name="start_cmd" value="stop" type="submit">Stop</button>
+    </form>
+    <p><a href="/logout">Log out</a></p>
+    <p>Emergency stop hotkey: ctrl+shift+x (set in script with STOP_ON_HOTKEY)</p>
+  </body>
+</html>
