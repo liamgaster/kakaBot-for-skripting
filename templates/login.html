@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+  <head><title>Bot Login</title></head>
+  <body>
+    <h2>Login</h2>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul>{% for m in messages %}<li>{{m}}</li>{% endfor %}</ul>
+      {% endif %}
+    {% endwith %}
+    <form action="/login" method="post">
+      <label>Username: <input name="username"></label><br>
+      <label>Password: <input type="password" name="password"></label><br>
+      <button type="submit">Login</button>
+    </form>
+    <p>Or <a href="/signup">Sign up</a></p>
+  </body>
+</html>
