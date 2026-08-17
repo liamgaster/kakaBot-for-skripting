@@ -252,7 +252,77 @@ def api_heartbeat():
 def get_script():
     return jsonify(active_bot_state)
 
-# --- ADMIN PANEL ---
+# --- ADMIN API ENDPOINTS FOR GUI CLIENT ---
+
+@app.route("/api/admin/users", methods=["POST"])
+def api_admin_users():
+    """Returns all registered users for the desktop GUI admin panel."""
+    data = request.get_json(silent=True) or {}
+    admin_user = data.get("admin_username", "").strip()
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT is_admin FROM users WHERE username = ?", (admin_user,))
+    row = c.fetchone()
+    if not row or row[0] != 1:
+        conn.close()
+        return jsonify({"status": "error", "message": "Admin privileges required"}), 403
+
+    c.execute("SELECT id, username, is_banned, is_admin, last_seen FROM users")
+    users = [
+        {
+            "id": u[0],
+            "username": u[1],
+            "is_banned": bool(u[2]),
+            "is_admin": bool(u[3]),
+            "last_seen": u[4] or "Never"
+        }
+        for u in c.fetchall()
+    ]
+    conn.close()
+    return jsonify({"status": "success", "users": users})
+
+@app.route("/api/admin/ban", methods=["POST"])
+def api_admin_ban():
+    """Bans/kicks a target user by ID."""
+    data = request.get_json(silent=True) or {}
+    admin_user = data.get("admin_username", "").strip()
+    target_id = data.get("target_id")
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT is_admin FROM users WHERE username = ?", (admin_user,))
+    row = c.fetchone()
+    if not row or row[0] != 1:
+        conn.close()
+        return jsonify({"status": "error", "message": "Admin privileges required"}), 403
+
+    c.execute("UPDATE users SET is_banned = 1 WHERE id = ? AND is_admin = 0", (target_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": "User banned successfully"})
+
+@app.route("/api/admin/unban", methods=["POST"])
+def api_admin_unban():
+    """Unbans a target user by ID."""
+    data = request.get_json(silent=True) or {}
+    admin_user = data.get("admin_username", "").strip()
+    target_id = data.get("target_id")
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT is_admin FROM users WHERE username = ?", (admin_user,))
+    row = c.fetchone()
+    if not row or row[0] != 1:
+        conn.close()
+        return jsonify({"status": "error", "message": "Admin privileges required"}), 403
+
+    c.execute("UPDATE users SET is_banned = 0 WHERE id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": "User unbanned successfully"})
+
+# --- WEB ADMIN PANEL ---
 
 @app.route("/admin")
 def admin_panel():
