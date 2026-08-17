@@ -19,8 +19,11 @@ import os
 import sys
 import threading
 import sqlite3
-from flask import Flask, jsonify, render_template, request, redirect, url_for, session, flash
+from flask import Flask, jsonify, render_template, render_template_string, request, redirect, url_for, session, flash
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# Reserved usernames that cannot be registered publicly
+RESERVED_USERNAMES = {"admin", "administrator", "root", "system", "moderator"}
 
 # Load Windows-only bot engine only if running on Windows
 if sys.platform == "win32":
@@ -43,7 +46,7 @@ DB = os.path.join(APPDATA_DIR, "users.db")
 
 # Flask init
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
-app.secret_key = os.urandom(24)
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
 
 # Simple sample DSL script
 DEFAULT_SCRIPT = '''# Example script
@@ -56,18 +59,39 @@ WHEN_SAID "mountain" : SWITCH_DIRECTION reverse
 STOP_ON_HOTKEY ctrl+shift+x
 '''
 
-# Simple DB init
+# DB init with dynamic column migrations and default admin seeding
 def init_db():
-    if not os.path.exists(DB):
-        conn = sqlite3.connect(DB)
-        c = conn.cursor()
-        c.execute("""CREATE TABLE users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT UNIQUE,
-                        password_hash TEXT
-                     )""")
-        conn.commit()
-        conn.close()
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE,
+                    password_hash TEXT,
+                    is_banned INTEGER DEFAULT 0,
+                    is_admin INTEGER DEFAULT 0,
+                    last_seen TIMESTAMP
+                 )""")
+    
+    # Auto-migrate existing user databases missing new columns
+    c.execute("PRAGMA table_info(users)")
+    existing_cols = [col[1] for col in c.fetchall()]
+    if "is_banned" not in existing_cols:
+        c.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+    if "is_admin" not in existing_cols:
+        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+    if "last_seen" not in existing_cols:
+        c.execute("ALTER TABLE users ADD COLUMN last_seen TIMESTAMP")
+
+    # Seed default admin account if not already present
+    c.execute("SELECT id FROM users WHERE username = 'admin'")
+    if not c.fetchone():
+        c.execute(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+            ("admin", generate_password_hash("ChangeMeSecurePassword123!"))
+        )
+        
+    conn.commit()
+    conn.close()
 
 init_db()
 
@@ -95,6 +119,11 @@ def signup():
         if not username or not password:
             flash("Username and password required.")
             return redirect(url_for("signup"))
+            
+        if username.lower() in RESERVED_USERNAMES:
+            flash("This username is reserved and cannot be registered.")
+            return redirect(url_for("signup"))
+
         conn = sqlite3.connect(DB)
         c = conn.cursor()
         try:
@@ -116,18 +145,31 @@ def login():
     password = request.form["password"]
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    c.execute("SELECT password_hash, is_banned, is_admin FROM users WHERE username = ?", (username,))
     row = c.fetchone()
+    
+    if row:
+        if row[1] == 1:
+            conn.close()
+            flash("Your account is banned.")
+            return redirect(url_for("home"))
+            
+        if check_password_hash(row[0], password):
+            c.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE username = ?", (username,))
+            conn.commit()
+            conn.close()
+            session["user"] = username
+            session["is_admin"] = bool(row[2])
+            return redirect(url_for("dashboard"))
+
     conn.close()
-    if row and check_password_hash(row[0], password):
-        session["user"] = username
-        return redirect(url_for("dashboard"))
     flash("Invalid credentials")
     return redirect(url_for("home"))
 
 @app.route("/logout")
 def logout():
     session.pop("user", None)
+    session.pop("is_admin", None)
     return redirect(url_for("home"))
 
 # --- API ENDPOINTS FOR CLIENT APP ---
@@ -140,6 +182,9 @@ def api_signup():
     if not username or not password:
         return jsonify({"status": "error", "message": "Missing credentials"}), 400
         
+    if username.lower() in RESERVED_USERNAMES:
+        return jsonify({"status": "error", "message": "This username is reserved."}), 400
+
     conn = sqlite3.connect(DB)
     c = conn.cursor()
     try:
@@ -160,17 +205,154 @@ def api_login():
     
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    c.execute("SELECT password_hash, is_banned, is_admin FROM users WHERE username = ?", (username,))
     row = c.fetchone()
-    conn.close()
     
-    if row and check_password_hash(row[0], password):
-        return jsonify({"status": "success", "message": "Logged in"})
+    if row:
+        if row[1] == 1:
+            conn.close()
+            return jsonify({"status": "error", "message": "Account is banned."}), 403
+            
+        if check_password_hash(row[0], password):
+            c.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE username = ?", (username,))
+            conn.commit()
+            conn.close()
+            return jsonify({
+                "status": "success", 
+                "message": "Logged in", 
+                "is_admin": bool(row[2])
+            })
+            
+    conn.close()
     return jsonify({"status": "error", "message": "Invalid username or password"}), 401
+
+@app.route("/api/heartbeat", methods=["POST"])
+def api_heartbeat():
+    """Client pings this endpoint to update online status and check for bans."""
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    if not username:
+        return jsonify({"status": "error", "message": "Username required"}), 400
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT is_banned FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+
+    if row and row[0] == 1:
+        conn.close()
+        return jsonify({"status": "banned", "message": "User is banned"}), 403
+
+    c.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
 
 @app.route("/api/get_script", methods=["GET"])
 def get_script():
     return jsonify(active_bot_state)
+
+# --- ADMIN PANEL ---
+
+@app.route("/admin")
+def admin_panel():
+    if not session.get("is_admin"):
+        flash("Access Denied: Admin privileges required.")
+        return redirect(url_for("dashboard"))
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT id, username, is_banned, is_admin, last_seen FROM users")
+    users = c.fetchall()
+    conn.close()
+
+    admin_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>MistBot Admin Dashboard</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f9; }
+            h2 { color: #333; }
+            table { width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px; }
+            th, td { padding: 10px; border: 1px solid #ccc; text-align: left; }
+            th { background-color: #eee; }
+            .banned { color: red; font-weight: bold; }
+            .active { color: green; font-weight: bold; }
+            .btn { padding: 5px 10px; text-decoration: none; border-radius: 3px; }
+            .btn-ban { background: #d9534f; color: white; }
+            .btn-unban { background: #5cb85c; color: white; }
+        </style>
+    </head>
+    <body>
+        <h2>MistBot User Management</h2>
+        <p><a href="{{ url_for('dashboard') }}">Back to Dashboard</a> | <a href="{{ url_for('logout') }}">Logout</a></p>
+        <hr>
+        <table>
+            <tr>
+                <th>ID</th>
+                <th>Username</th>
+                <th>Status</th>
+                <th>Role</th>
+                <th>Last Active (UTC)</th>
+                <th>Action</th>
+            </tr>
+            {% for u in users %}
+            <tr>
+                <td>{{ u[0] }}</td>
+                <td>{{ u[1] }}</td>
+                <td>
+                    {% if u[2] == 1 %}
+                        <span class="banned">Banned</span>
+                    {% else %}
+                        <span class="active">Active</span>
+                    {% endif %}
+                </td>
+                <td>{{ 'Admin' if u[3] == 1 else 'User' }}</td>
+                <td>{{ u[4] if u[4] else 'Never' }}</td>
+                <td>
+                    {% if u[3] != 1 %}
+                        {% if u[2] == 1 %}
+                            <a href="{{ url_for('unban_user', user_id=u[0]) }}" class="btn btn-unban">Unban</a>
+                        {% else %}
+                            <a href="{{ url_for('ban_user', user_id=u[0]) }}" class="btn btn-ban">Ban / Kick</a>
+                        {% endif %}
+                    {% else %}
+                        <i>Administrator</i>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </body>
+    </html>
+    """
+    return render_template_string(admin_template, users=users)
+
+@app.route("/admin/ban/<int:user_id>")
+def ban_user(user_id):
+    if not session.get("is_admin"):
+        return "Access Denied", 403
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    # Ensure superadmins cannot ban each other
+    c.execute("UPDATE users SET is_banned = 1 WHERE id = ? AND is_admin = 0", (user_id,))
+    conn.commit()
+    conn.close()
+    flash("User banned successfully.")
+    return redirect(url_for("admin_panel"))
+
+@app.route("/admin/unban/<int:user_id>")
+def unban_user(user_id):
+    if not session.get("is_admin"):
+        return "Access Denied", 403
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_banned = 0 WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    flash("User unbanned successfully.")
+    return redirect(url_for("admin_panel"))
 
 # --- WEB DASHBOARD ---
 
