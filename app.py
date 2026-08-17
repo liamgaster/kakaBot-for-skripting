@@ -19,7 +19,7 @@ import os
 import sys
 import threading
 import sqlite3
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import Flask, jsonify, render_template, request, redirect, url_for, session, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Load Windows-only bot engine only if running on Windows
@@ -75,6 +75,12 @@ init_db()
 engine = None
 engine_thread = None
 
+# Active script storage for API polling
+active_bot_state = {
+    "status": "stopped",
+    "script": ""
+}
+
 @app.route("/")
 def home():
     if "user" in session:
@@ -124,6 +130,50 @@ def logout():
     session.pop("user", None)
     return redirect(url_for("home"))
 
+# --- API ENDPOINTS FOR CLIENT APP ---
+
+@app.route("/api/signup", methods=["POST"])
+def api_signup():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    if not username or not password:
+        return jsonify({"status": "error", "message": "Missing credentials"}), 400
+        
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO users (username, password_hash) VALUES (?,?)",
+                  (username, generate_password_hash(password)))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success", "message": "Account created!"})
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"status": "error", "message": "Username already exists."}), 409
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    
+    if row and check_password_hash(row[0], password):
+        return jsonify({"status": "success", "message": "Logged in"})
+    return jsonify({"status": "error", "message": "Invalid username or password"}), 401
+
+@app.route("/api/get_script", methods=["GET"])
+def get_script():
+    return jsonify(active_bot_state)
+
+# --- WEB DASHBOARD ---
+
 @app.route("/dashboard", methods=["GET","POST"])
 def dashboard():
     if "user" not in session:
@@ -137,6 +187,8 @@ def dashboard():
         start_cmd = request.form.get("start_cmd", "")
         
         if start_cmd == "start":
+            active_bot_state["status"] = "running"
+            active_bot_state["script"] = script_text
             if BotEngine is None:
                 flash("Bot engine cannot run on Linux cloud servers. Run locally on Windows.")
             elif engine_thread and engine_thread.is_alive():
@@ -150,6 +202,7 @@ def dashboard():
                 engine_thread.start()
                 flash("Engine started")
         elif start_cmd == "stop":
+            active_bot_state["status"] = "stopped"
             if engine:
                 engine.stop()
                 flash("Engine stop requested")
