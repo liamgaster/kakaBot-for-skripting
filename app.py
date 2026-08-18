@@ -172,6 +172,66 @@ def logout():
     session.pop("is_admin", None)
     return redirect(url_for("home"))
 
+@app.route("/change_password", methods=["GET", "POST"])
+def change_password():
+    if "user" not in session:
+        return redirect(url_for("home"))
+        
+    if request.method == "POST":
+        old_password = request.form.get("old_password", "")
+        new_password = request.form.get("new_password", "")
+        username = session["user"]
+        
+        if not old_password or not new_password:
+            flash("Both current and new passwords are required.")
+            return redirect(url_for("change_password"))
+            
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        
+        if row and check_password_hash(row[0], old_password):
+            c.execute("UPDATE users SET password_hash = ? WHERE username = ?", 
+                      (generate_password_hash(new_password), username))
+            conn.commit()
+            conn.close()
+            flash("Password changed successfully.")
+            return redirect(url_for("dashboard"))
+        else:
+            conn.close()
+            flash("Incorrect current password.")
+            return redirect(url_for("change_password"))
+            
+    template = '''
+    <!DOCTYPE html>
+    <html>
+    <head><title>Change Password</title></head>
+    <body style="font-family: Arial; margin: 20px;">
+        <h2>Change Password</h2>
+        {% with messages = get_flashed_messages() %}
+          {% if messages %}
+            <ul style="color: red;">
+            {% for message in messages %}
+              <li>{{ message }}</li>
+            {% endfor %}
+            </ul>
+          {% endif %}
+        {% endwith %}
+        <form method="POST">
+            <label>Current Password:</label><br>
+            <input type="password" name="old_password" required><br><br>
+            <label>New Password:</label><br>
+            <input type="password" name="new_password" required><br><br>
+            <button type="submit">Update Password</button>
+        </form>
+        <br>
+        <a href="{{ url_for('dashboard') }}">Back to Dashboard</a>
+    </body>
+    </html>
+    '''
+    return render_template_string(template)
+
 # --- API ENDPOINTS FOR CLIENT APP ---
 
 @app.route("/api/signup", methods=["POST"])
@@ -225,6 +285,31 @@ def api_login():
             
     conn.close()
     return jsonify({"status": "error", "message": "Invalid username or password"}), 401
+
+@app.route("/api/change_password", methods=["POST"])
+def api_change_password():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    old_password = data.get("old_password", "")
+    new_password = data.get("new_password", "")
+    
+    if not username or not old_password or not new_password:
+        return jsonify({"status": "error", "message": "Missing required fields"}), 400
+        
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    
+    if row and check_password_hash(row[0], old_password):
+        c.execute("UPDATE users SET password_hash = ? WHERE username = ?", 
+                  (generate_password_hash(new_password), username))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success", "message": "Password updated successfully"})
+    else:
+        conn.close()
+        return jsonify({"status": "error", "message": "Invalid username or current password"}), 401
 
 @app.route("/api/heartbeat", methods=["POST"])
 def api_heartbeat():
